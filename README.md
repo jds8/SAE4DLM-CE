@@ -40,6 +40,7 @@ Train sparse autoencoders on hidden activations from DLM layers, typically `resi
 cd dictionary_learning_demo
 python -u parallel_training_layers.py
 ```
+<img width="1419" height="658" alt="a1a404a31ce30048b7a56085bdff876e" src="https://github.com/user-attachments/assets/a91888c8-f0fa-4e39-8c79-15091591b7d8" />
 
 ------
 
