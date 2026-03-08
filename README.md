@@ -22,7 +22,7 @@ Diffusion Language Models generate text through iterative denoising, which makes
 
 ```
 .
-├── dictionary_learning_demo/   # Train and evaluate SAEs on DLM activations
+├── train_dlm_sae/   # Train and evaluate SAEs on DLM activations
 ├── autointerp_hf/             # Auto-interpret DLM SAE features
 ├── steering/                  # Steer DLMs with SAE features
 └── dlm_order/                 # Analyze DLM order/update strategies with SAE features
@@ -39,7 +39,7 @@ Train sparse autoencoders on hidden activations from DLM layers, typically `resi
 **Example**
 
 ```
-cd dictionary_learning_demo
+cd train_dlm_sae
 python -u parallel_training_layers.py
 ```
 <img width="1419" height="658" alt="a1a404a31ce30048b7a56085bdff876e" src="https://github.com/user-attachments/assets/a91888c8-f0fa-4e39-8c79-15091591b7d8" />
