@@ -12,6 +12,8 @@
 
 ## Overview
 
+<img width="1414" height="674" alt="192d2a6bede37e5256c6e88cdb337aff" src="https://github.com/user-attachments/assets/b17eb7d3-8e95-49db-bcb8-41b7951fcc4f" />
+
 Diffusion Language Models generate text through iterative denoising, which makes their internal representations and control mechanisms fundamentally different from autoregressive LLMs. **SAE4DLM** is built to study those representations directly, using SAEs as a shared interface for measurement, interpretation, and intervention.
 
 ------
