@@ -25,4 +25,4 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 
-tokenizer.save_pretrained('tokenizer')
+tokenizer.save_pretrained('dream_tokenizer')
