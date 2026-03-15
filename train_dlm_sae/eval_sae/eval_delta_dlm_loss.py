@@ -728,6 +728,7 @@ def main():
     )
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument("--ae_root", type=str, required=True)
+    parser.add_argument("--tokenizer_name", type=str, default='')
     parser.add_argument("--token_budget", type=int, default=50_000_000)
     parser.add_argument("--batch_size_text", type=int, default=8)
     parser.add_argument("--max_len", type=int, default=2048)
@@ -796,8 +797,9 @@ def main():
     # Tokenizer
     ############################################
     print(f"[Setup] Loading tokenizer for {args.model_name} ...", flush=True)
+    tokenizer_name = args.tokenizer_name if args.tokenizer_name else args.model_name
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name,
+        tokenizer_name,
         trust_remote_code=True,
         use_fast=True,
     )
