@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 from tqdm import tqdm
 
-from dictionary_learning import utils
+from dictionary_learning.dictionary_learning import utils
 
 
 ############################################
