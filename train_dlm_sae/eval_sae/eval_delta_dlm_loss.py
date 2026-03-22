@@ -1003,6 +1003,7 @@ def main():
                     t_max=args.t_max,
                     fixed_t=args.fixed_t,  # None -> random t ~ U[t_min, t_max]
                     verbose=args.verbose,
+                    #ADDED
                     noise_std=args.noise_std,
                 )
                 #ADDED
