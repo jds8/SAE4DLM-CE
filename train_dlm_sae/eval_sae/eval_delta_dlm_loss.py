@@ -11,6 +11,7 @@ from typing import Iterable, List, Dict, Tuple, Optional, Any
 
 import torch as t
 import torch.nn.functional as F
+from train_dlm_sae.eval_sae.eval_delta_llm_loss import tokenize_batch
 from transformers import AutoModel, AutoTokenizer
 from tqdm import tqdm
 
@@ -369,8 +370,33 @@ def register_noise_hook(submodule: t.nn.Module, noise_std: float, seed: int = 42
         return submodule.register_forward_hook(_hook)
     else:
         raise ValueError("io must be 'in' or 'out'")
+    
+# ADDED
 
-############################################
+
+
+def compute_activation_stats(model, submodule, tokenizer, texts: List[str], max_len: int, device: t.device, io: str = "out"):
+    activations = []
+
+    if io == "out":
+        def _hook(_, __, output):
+            act = _first_tensor(output)
+            activations.append(act.detach().cpu())
+            return output
+
+        handle = submodule.register_forward_hook(_hook)
+        try: 
+            batch = tokenize_batch(tokenizer, texts, max_len=max_len, device=device)
+            _safe_forward_with_masks(model, batch, prefer_additive=True)
+        finally:
+            handle.remove()
+    all_acts = t.cat(activations)
+    mean = all_acts.mean().item()
+    std = all_acts.std().item()
+    return mean, std
+
+    
+########################################
 # Tokenization / masking / timestep helpers
 ############################################
 
@@ -910,7 +936,20 @@ def main():
             f"[Info] tokenizer.mask_token_id not found; using fallback id = {mask_token_id}",
             flush=True,
         )
+    #ADDED
+    print("[Setup] Computing activation statistics...", flush=True)
+    stat_texts = []
+    stream = new_stream()
+    for _ in range(4): 
+        try:
+            stat_texts.append(next(stream))
+        except StopIteration:
+            break
 
+    for layer_name in ["resid_post_layer_1", "resid_post_layer_10", "resid_post_layer_23"]:
+        stat_submodule = utils.get_submodule(model, layer_name)
+        mean, std = compute_activation_stats(model, stat_submodule, tokenizer, stat_texts, max_len=args.max_len, device=t.device(args.device))
+        print(f"[Stats] {layer_name}: mean={mean:.4f}, std={std:.4f}", flush=True)
     ############################################
     # Scan for all SAE checkpoints under ae_root
     ############################################
