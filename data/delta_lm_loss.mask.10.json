@@ -1,0 +1,15 @@
+{
+  "tokens_masked_evaluated": 10000321.0,
+  "dream_weighted_loss_clean(mask)": 27.092349535579906,
+  "dream_weighted_loss_sae(mask)": 28.32591953798283,
+  "delta_lm_loss(mask)": 1.2335700024029244,
+  "weighting": "mask-only CE weighted by 1/t",
+  "t_min": 0.05,
+  "t_max": 0.5,
+  "fixed_t": null,
+  "max_len": 2048,
+  "batch_size_text": 8,
+  "io": "out",
+  "heldout_dataset": "common-pile/comma_v0.1_training_dataset",
+  "skip_first_n_examples": 500000
+}
