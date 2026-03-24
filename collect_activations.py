@@ -436,54 +436,89 @@ def compute_stats_for_batch(
 
 class LayerStatsAccumulator:
     """
-    Accumulates the three statistics across all text sequences and diffusion timesteps.
+    Accumulates the three statistics across all text sequences and diffusion timesteps,
+    separately for unmasked tokens and masked ([MASK]) tokens.
 
-    Internal buffers have shape [F, T] per layer per statistic.
-    Finalize() returns a tensor of shape [L, 3, F, T].
+    Internal buffers have shape [F, T] per layer per statistic per token type.
+    Finalize() returns a tensor of shape [2, L, 3, F, T] where:
+        dim 0: token type  (0 = unmasked, 1 = masked)
+        dim 1: layer index
+        dim 2: statistic   (0 = all_token_avg, 1 = top_m_avg, 2 = activation_freq)
+        dim 3: SAE feature index
+        dim 4: diffusion timestep
     """
 
-    def __init__(self, layers: List[int], feature_dim: int, num_steps: int, top_m: int):
+    def __init__(self, layers: List[int], feature_dim: int, num_steps: int, top_m: int, mask_token_id: int):
         self.layers = list(layers)
         self.feature_dim = int(feature_dim)
         self.num_steps = int(num_steps)
         self.top_m = int(top_m)
+        self.mask_token_id = int(mask_token_id)
 
         # State set before each forward pass by replay_history_and_collect
         self.current_timestep: Optional[int] = None
+        self.current_input_ids: Optional[torch.Tensor] = None
         self.current_attention_mask: Optional[torch.Tensor] = None
         self.current_region_start: int = 0
         self.current_region_end: Optional[int] = None
 
-        # Running sums: {layer: [F, T]}
-        self.sum_stat1: Dict[int, torch.Tensor] = {
-            l: torch.zeros(feature_dim, num_steps, dtype=torch.float32) for l in self.layers
-        }
-        self.sum_stat2: Dict[int, torch.Tensor] = {
-            l: torch.zeros(feature_dim, num_steps, dtype=torch.float32) for l in self.layers
-        }
-        self.sum_stat3: Dict[int, torch.Tensor] = {
-            l: torch.zeros(feature_dim, num_steps, dtype=torch.float32) for l in self.layers
-        }
-        # Number of sequences that contributed to each timestep column
-        self.seq_count_by_timestep = torch.zeros(num_steps, dtype=torch.long)
+        def _zero_buf():
+            return {l: torch.zeros(feature_dim, num_steps, dtype=torch.float32) for l in self.layers}
+
+        # Running sums for unmasked tokens (token_type=0): {layer: [F, T]}
+        self.unmasked_sum_stat1 = _zero_buf()
+        self.unmasked_sum_stat2 = _zero_buf()
+        self.unmasked_sum_stat3 = _zero_buf()
+
+        # Running sums for masked tokens (token_type=1): {layer: [F, T]}
+        self.masked_sum_stat1 = _zero_buf()
+        self.masked_sum_stat2 = _zero_buf()
+        self.masked_sum_stat3 = _zero_buf()
+
+        # Number of sequences contributing to each timestep, per token type
+        self.unmasked_seq_count = torch.zeros(num_steps, dtype=torch.long)
+        self.masked_seq_count   = torch.zeros(num_steps, dtype=torch.long)
 
     def start_timestep(
         self,
         timestep: int,
+        input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         region_start: int,
         region_end: Optional[int] = None,
     ) -> None:
         """Called once per (text, timestep) pair before the forward pass."""
         self.current_timestep = int(timestep)
+        self.current_input_ids = input_ids
         self.current_attention_mask = attention_mask
         self.current_region_start = int(region_start)
         self.current_region_end = None if region_end is None else int(region_end)
 
+    def _accumulate(
+        self,
+        sum_s1: Dict[int, torch.Tensor],
+        sum_s2: Dict[int, torch.Tensor],
+        sum_s3: Dict[int, torch.Tensor],
+        seq_count: torch.Tensor,
+        layer: int,
+        feats_region: torch.Tensor,
+        token_mask: torch.Tensor,
+        t: int,
+    ) -> None:
+        """Helper: compute stats and add to the given running-sum buffers."""
+        if token_mask.sum().item() == 0:
+            return
+        s1, s2, s3 = compute_stats_for_batch(feats_region, token_mask, self.top_m)
+        sum_s1[layer][:, t] += s1.sum(dim=0).cpu()
+        sum_s2[layer][:, t] += s2.sum(dim=0).cpu()
+        sum_s3[layer][:, t] += s3.sum(dim=0).cpu()
+        seq_count[t] += feats_region.shape[0]
+
     def update(self, layer: int, feats: torch.Tensor) -> None:
         """
         Called inside the forward hook with raw SAE features [B, S, F].
-        Slices to the requested token region and accumulates statistics.
+        Splits the token region into unmasked vs masked positions and
+        accumulates statistics for each type separately.
         """
         if self.current_timestep is None or self.current_attention_mask is None:
             raise RuntimeError("start_timestep() must be called before the forward pass.")
@@ -493,35 +528,50 @@ class LayerStatsAccumulator:
         if end <= start:
             return
 
-        feats_region = feats[:, start:end, :].float()
-        mask_region = self.current_attention_mask[:, start:end].bool()
+        feats_region  = feats[:, start:end, :].float()             # [B, S', F]
+        attn_region   = self.current_attention_mask[:, start:end].bool()  # [B, S']
+        ids_region    = self.current_input_ids[:, start:end]        # [B, S']
 
-        # Skip if no valid tokens in the region (e.g. very short prompt)
-        if mask_region.sum().item() == 0:
-            return
-
-        s1, s2, s3 = compute_stats_for_batch(feats_region, mask_region, self.top_m)
+        # Boolean masks: True where a token is unmasked / masked
+        is_mask_token  = (ids_region == self.mask_token_id)         # [B, S']
+        unmasked_mask  = attn_region & ~is_mask_token               # valid + not [MASK]
+        masked_mask    = attn_region & is_mask_token                # valid + [MASK]
 
         t = self.current_timestep
-        # Sum over the batch dimension; finalize() divides by seq count later
-        self.sum_stat1[layer][:, t] += s1.sum(dim=0).cpu()
-        self.sum_stat2[layer][:, t] += s2.sum(dim=0).cpu()
-        self.sum_stat3[layer][:, t] += s3.sum(dim=0).cpu()
-        self.seq_count_by_timestep[t] += feats_region.shape[0]
+
+        # Accumulate statistics for each token type
+        self._accumulate(
+            self.unmasked_sum_stat1, self.unmasked_sum_stat2, self.unmasked_sum_stat3,
+            self.unmasked_seq_count, layer, feats_region, unmasked_mask, t,
+        )
+        self._accumulate(
+            self.masked_sum_stat1, self.masked_sum_stat2, self.masked_sum_stat3,
+            self.masked_seq_count, layer, feats_region, masked_mask, t,
+        )
 
     def finalize(self) -> torch.Tensor:
         """
         Divide running sums by sequence counts to get per-timestep means.
-        Returns a tensor of shape [L, 3, F, T].
+        Returns a tensor of shape [2, L, 3, F, T].
+            [0] = unmasked token statistics
+            [1] = masked token statistics
         """
         num_layers = len(self.layers)
-        out = torch.zeros(num_layers, 3, self.feature_dim, self.num_steps, dtype=torch.float32)
-        counts = self.seq_count_by_timestep.clamp(min=1).float()  # [T]
+        out = torch.zeros(2, num_layers, 3, self.feature_dim, self.num_steps, dtype=torch.float32)
+
+        unmasked_counts = self.unmasked_seq_count.clamp(min=1).float()  # [T]
+        masked_counts   = self.masked_seq_count.clamp(min=1).float()    # [T]
 
         for i, layer in enumerate(self.layers):
-            out[i, 0] = self.sum_stat1[layer] / counts.unsqueeze(0)
-            out[i, 1] = self.sum_stat2[layer] / counts.unsqueeze(0)
-            out[i, 2] = self.sum_stat3[layer] / counts.unsqueeze(0)
+            # Unmasked (token_type = 0)
+            out[0, i, 0] = self.unmasked_sum_stat1[layer] / unmasked_counts.unsqueeze(0)
+            out[0, i, 1] = self.unmasked_sum_stat2[layer] / unmasked_counts.unsqueeze(0)
+            out[0, i, 2] = self.unmasked_sum_stat3[layer] / unmasked_counts.unsqueeze(0)
+
+            # Masked (token_type = 1)
+            out[1, i, 0] = self.masked_sum_stat1[layer] / masked_counts.unsqueeze(0)
+            out[1, i, 1] = self.masked_sum_stat2[layer] / masked_counts.unsqueeze(0)
+            out[1, i, 2] = self.masked_sum_stat3[layer] / masked_counts.unsqueeze(0)
 
         return out
 
@@ -575,7 +625,8 @@ def replay_history_and_collect(
 ) -> None:
     """
     Re-run the model once per diffusion timestep using the token sequences
-    stored in history. The forward hooks collect SAE features at each step.
+    stored in history. The forward hooks collect SAE features at each step,
+    split by unmasked vs masked token positions.
 
     token_scope:
         'generated' - statistics computed only over the newly generated tokens
@@ -596,6 +647,7 @@ def replay_history_and_collect(
 
         accumulator.start_timestep(
             timestep=timestep,
+            input_ids=input_ids,
             attention_mask=attention_mask,
             region_start=region_start,
             region_end=region_end,
@@ -614,24 +666,29 @@ def save_outputs(
     args: argparse.Namespace,
     layers: List[int],
     tensor: torch.Tensor,
-    counts: torch.Tensor,
+    unmasked_counts: torch.Tensor,
+    masked_counts: torch.Tensor,
 ) -> None:
-    """Save the [L, 3, F, T] tensor plus metadata to out_dir."""
+    """Save the [2, L, 3, F, T] tensor plus metadata to out_dir."""
     os.makedirs(out_dir, exist_ok=True)
 
     # Raw tensor for fast loading
-    torch.save(tensor, os.path.join(out_dir, "layer_stats_Lx3xFxT.pt"))
+    torch.save(tensor, os.path.join(out_dir, "layer_stats_2xLx3xFxT.pt"))
+
+    stats_order = [
+        "all_token_average",
+        f"top_{args.top_m}_token_average",
+        "activation_frequency",
+    ]
 
     # Full bundle with config for reproducibility
     bundle = {
         "tensor": tensor,
         "layers": layers,
-        "stats_order": [
-            "all_token_average",
-            f"top_{args.top_m}_token_average",
-            "activation_frequency",
-        ],
-        "count_by_timestep": counts,
+        "token_types": ["unmasked", "masked"],
+        "stats_order": stats_order,
+        "unmasked_count_by_timestep": unmasked_counts,
+        "masked_count_by_timestep": masked_counts,
         "config": vars(args),
     }
     torch.save(bundle, os.path.join(out_dir, "layer_stats_bundle.pt"))
@@ -640,12 +697,10 @@ def save_outputs(
     metadata = {
         "layers": layers,
         "tensor_shape": list(tensor.shape),
-        "stats_order": [
-            "all_token_average",
-            f"top_{args.top_m}_token_average",
-            "activation_frequency",
-        ],
-        "count_by_timestep": counts.tolist(),
+        "token_types": ["unmasked", "masked"],
+        "stats_order": stats_order,
+        "unmasked_count_by_timestep": unmasked_counts.tolist(),
+        "masked_count_by_timestep": masked_counts.tolist(),
         "config": vars(args),
     }
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
@@ -686,11 +741,17 @@ def main() -> None:
     print(f"Loaded SAEs for layers: {args.layers}")
 
     feature_dim = next(iter(saes.values())).dict_size
+    mask_token_id = tokenizer.mask_token_id
+    if mask_token_id is None:
+        raise RuntimeError("Tokenizer has no mask_token_id. Cannot separate masked/unmasked tokens.")
+    print(f"Mask token id: {mask_token_id}")
+
     accumulator = LayerStatsAccumulator(
         layers=args.layers,
         feature_dim=feature_dim,
         num_steps=args.steps,
         top_m=args.top_m,
+        mask_token_id=mask_token_id,
     )
 
     processed = 0
@@ -724,12 +785,14 @@ def main() -> None:
         args=args,
         layers=args.layers,
         tensor=final_tensor,
-        counts=accumulator.seq_count_by_timestep,
+        unmasked_counts=accumulator.unmasked_seq_count,
+        masked_counts=accumulator.masked_seq_count,
     )
 
     print("Done.")
     print(f"Processed texts : {processed}")
-    print(f"Final tensor shape : {tuple(final_tensor.shape)}  (L x 3 x F x T)")
+    print(f"Final tensor shape : {tuple(final_tensor.shape)}  (2 x L x 3 x F x T)")
+    print(f"  dim 0: token type (0=unmasked, 1=masked)")
     print(f"Outputs written to : {args.out_dir}")
 
 
