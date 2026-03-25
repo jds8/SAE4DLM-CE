@@ -1,10 +1,11 @@
 """
 visualize_activations.py
 
-Loads the [L x 3 x F x T] activation tensor produced by collect_activations.py
-and generates two sets of plots:
+Loads the [L x 3 x F x T] or [2 x L x 3 x F x T] activation tensor produced
+by collect_activations.py and generates two sets of plots:
 
-  1. Heatmaps (3 x L):  features (sorted by peak time) vs diffusion timestep
+  1. Heatmaps (3 x L): features (sorted by peak time) vs diffusion timestep
+                       features (unsorted, original index) vs diffusion timestep
   2. Histograms (3 x L): distribution of peak times across all features
 
 Usage:
@@ -90,12 +91,12 @@ def parse_args() -> argparse.Namespace:
 def load_data(args: argparse.Namespace):
     """
     Returns:
-        tensor: [L, 3, F, T]  float32
+        tensor: [L, 3, F, T] or [2, L, 3, F, T]  float32
         layers: list of int, length L
     """
     if args.bundle:
         bundle = torch.load(args.bundle, map_location="cpu", weights_only=False)
-        tensor = bundle["tensor"]           # [L, 3, F, T]
+        tensor = bundle["tensor"]
         layers = list(bundle["layers"])
     else:
         tensor = torch.load(args.tensor, map_location="cpu", weights_only=False)
@@ -104,13 +105,11 @@ def load_data(args: argparse.Namespace):
         layers = list(args.layers)
 
     if tensor.ndim == 4:
-        # Old format [L, 3, F, T]: verify layer count
         if tensor.shape[0] != len(layers):
             raise ValueError(
                 f"Tensor has {tensor.shape[0]} layers but {len(layers)} layer indices were provided."
             )
     elif tensor.ndim == 5:
-        # New format [2, L, 3, F, T]: verify layer count on dim 1
         if tensor.shape[1] != len(layers):
             raise ValueError(
                 f"Tensor has {tensor.shape[1]} layers but {len(layers)} layer indices were provided."
@@ -171,7 +170,7 @@ def plot_heatmap(
     colormap: str,
 ) -> None:
     """
-    Plot a single heatmap of features (sorted by peak time) vs diffusion timestep.
+    Plot a heatmap of features sorted by peak diffusion time vs diffusion timestep.
 
     Args:
         activation: [F, T]
@@ -180,16 +179,12 @@ def plot_heatmap(
 
     # Optionally restrict to the top-N features by mean activation
     if top_features is not None and top_features < F:
-        mean_act = activation.mean(axis=1)          # [F]
+        mean_act = activation.mean(axis=1)
         top_idx = np.argsort(mean_act)[-top_features:]
         activation = activation[top_idx]
         F = top_features
 
     sorted_act, _ = sort_features_by_peak_time(activation)
-
-    # Clip colormap range to 99th percentile to prevent outliers from washing out the plot
-    vmax = np.percentile(sorted_act[sorted_act > 0], 99) if (sorted_act > 0).any() else 1.0
-    vmin = 0.0
 
     fig, ax = plt.subplots(figsize=(10, 6))
     im = ax.imshow(
@@ -198,10 +193,8 @@ def plot_heatmap(
         origin="lower",
         cmap=colormap,
         interpolation="nearest",
-        vmin=vmin,
-        vmax=vmax,
     )
-    fig.colorbar(im, ax=ax, shrink=0.8, label=f"{STAT_NAMES[stat_idx]} (clipped at 99th pct)")
+    fig.colorbar(im, ax=ax, shrink=0.8, label=STAT_NAMES[stat_idx])
 
     ax.set_title(
         f"Layer {layer} — {STAT_NAMES[stat_idx]}\n"
@@ -215,7 +208,6 @@ def plot_heatmap(
     ax.set_xticks(ticks)
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: str(int(x))))
 
-    # Annotate y-axis with approximate peak-time thirds
     thirds = [0, F // 3, 2 * F // 3, F - 1]
     ax.set_yticks(thirds)
     ax.set_yticklabels([f"{v}" for v in thirds])
@@ -238,7 +230,7 @@ def plot_heatmap_unsorted(
     token_type_name: str,
 ) -> None:
     """
-    Plot a heatmap of features in their original (unsorted) order vs diffusion timestep.
+    Plot a heatmap of features in their original (unsorted) index order vs diffusion timestep.
     This allows direct feature index comparison across different plots and token types.
 
     Args:
@@ -253,10 +245,6 @@ def plot_heatmap_unsorted(
         activation = activation[top_idx]
         F = top_features
 
-    # Clip colormap range to 99th percentile to prevent outliers from washing out the plot
-    vmax = np.percentile(activation[activation > 0], 99) if (activation > 0).any() else 1.0
-    vmin = 0.0
-
     fig, ax = plt.subplots(figsize=(10, 6))
     im = ax.imshow(
         activation,
@@ -264,10 +252,8 @@ def plot_heatmap_unsorted(
         origin="lower",
         cmap=colormap,
         interpolation="nearest",
-        vmin=vmin,
-        vmax=vmax,
     )
-    fig.colorbar(im, ax=ax, shrink=0.8, label=f"{STAT_NAMES[stat_idx]} (clipped at 99th pct)")
+    fig.colorbar(im, ax=ax, shrink=0.8, label=STAT_NAMES[stat_idx])
 
     ax.set_title(
         f"Layer {layer} — {STAT_NAMES[stat_idx]} [{token_type_name}]\n"
@@ -342,7 +328,6 @@ def main() -> None:
 
     # Support both old [L, 3, F, T] and new [2, L, 3, F, T] tensor shapes.
     if tensor.ndim == 4:
-        # Old format: wrap in a fake token_type dimension for uniform handling
         tensor = tensor.unsqueeze(0)
         token_type_names = ["all"]
     elif tensor.ndim == 5:
@@ -356,10 +341,7 @@ def main() -> None:
     print(f"Token types: {token_type_names}")
 
     # ------------------------------------------------------------------
-    # 1. Heatmaps  (token_types x 3 x L)
-    #    Two variants per (token_type, layer, stat):
-    #      a) sorted by peak time  — reveals temporal specialization ordering
-    #      b) unsorted (original feature index order) — allows cross-plot comparison
+    # 1. Heatmaps: sorted + unsorted
     # ------------------------------------------------------------------
     print("\nGenerating heatmaps...")
     for tt, tt_name in enumerate(token_type_names):
@@ -368,7 +350,6 @@ def main() -> None:
         for i, layer in enumerate(layers):
             for s in range(num_stats):
                 activation = tensor[tt, i, s].numpy()   # [F, T]
-                # Sorted heatmap
                 plot_heatmap(
                     activation=activation,
                     layer=layer,
@@ -378,7 +359,6 @@ def main() -> None:
                     dpi=args.dpi,
                     colormap=args.colormap,
                 )
-                # Unsorted heatmap (features in original index order)
                 plot_heatmap_unsorted(
                     activation=activation,
                     layer=layer,
@@ -391,7 +371,7 @@ def main() -> None:
                 )
 
     # ------------------------------------------------------------------
-    # 2. Peak time histograms  (token_types x 3 x L)
+    # 2. Peak time histograms
     # ------------------------------------------------------------------
     print("\nGenerating peak time histograms...")
     for tt, tt_name in enumerate(token_type_names):
@@ -407,7 +387,7 @@ def main() -> None:
                     dpi=args.dpi,
                 )
 
-    total = num_token_types * 3 * L * num_stats  # sorted + unsorted heatmaps + histograms
+    total = num_token_types * 3 * L * num_stats
     print(f"\nDone. {total} plots saved under: {args.out_dir}/")
 
 
