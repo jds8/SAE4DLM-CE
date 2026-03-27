@@ -1,5 +1,6 @@
 from huggingface_hub import list_repo_files, hf_hub_download
 from transformers import AutoModel, AutoTokenizer
+import torch
 
 files = list_repo_files("AwesomeInterpretability/dlm-mask-topk-sae")
 
