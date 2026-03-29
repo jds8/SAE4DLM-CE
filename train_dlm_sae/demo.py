@@ -177,7 +177,7 @@ def _load_model_and_tokenizer(model_name: str, dtype):
         model_name,
         trust_remote_code=True,  # required for Dream models
         device_map="auto",
-        dtype=dtype              # avoid deprecated torch_dtype
+        torch_dtype=dtype              # avoid deprecated torch_dtype
     )
     model.eval()
     return model, tok
@@ -284,7 +284,7 @@ def run_sae_training(
     t.manual_seed(demo_config.random_seeds[0])
 
     # Canonicalize device once and pass it everywhere
-    device = _canonical_device(device)
+    # device = _canonical_device(device)
 
     # Model/data hyperparams (from demo_config for Dream-7B)
     context_length = demo_config.DLM_CONFIG[model_name].context_length
