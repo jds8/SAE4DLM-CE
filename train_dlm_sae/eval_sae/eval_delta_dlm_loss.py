@@ -1,17 +1,16 @@
 # eval_delta_lm_loss.py
 # -*- coding: utf-8 -*-
 
-from email import generator
 import os
 import json
 import argparse
 import warnings
 import inspect
 from typing import Iterable, List, Dict, Tuple, Optional, Any
+from xml.parsers.expat import model
 
 import torch as t
 import torch.nn.functional as F
-from train_dlm_sae.eval_sae.eval_delta_llm_loss import tokenize_batch
 from transformers import AutoModel, AutoTokenizer
 from tqdm import tqdm
 
@@ -937,6 +936,13 @@ def main():
             flush=True,
         )
     #ADDED
+    def new_stream():
+        # Same distribution as training, skip head for held-out
+        return heldout_stream(
+            dataset=args.heldout_dataset,
+            skip_first_n_examples=args.skip_first_n_examples,
+        )
+
     print("[Setup] Computing activation statistics...", flush=True)
     stat_texts = []
     stream = new_stream()
@@ -947,7 +953,8 @@ def main():
             break
 
     for layer_name in ["resid_post_layer_1", "resid_post_layer_10", "resid_post_layer_23"]:
-        stat_submodule = utils.get_submodule(model, layer_name)
+        layer_idx = int(layer_name.split("_")[-1])
+        stat_submodule = utils.get_submodule(model, layer_idx)
         mean, std = compute_activation_stats(model, stat_submodule, tokenizer, stat_texts, max_len=args.max_len, device=t.device(args.device))
         print(f"[Stats] {layer_name}: mean={mean:.4f}, std={std:.4f}", flush=True)
     ############################################
@@ -963,17 +970,20 @@ def main():
         )
         sae_dirs = utils.get_nested_folders(args.ae_root)
 
-    print(f"[Scan] Found {len(sae_dirs)} SAE folders.", flush=True)
+    print(f"[Scan] Found {len(sae_dirs)} SAE folders before filter.", flush=True)
+
+    sae_dirs = [
+        d for d in sae_dirs
+        if "/resid_post_layer_1/" in d and os.path.basename(d) == "trainer_0"
+    ]
+
+    print(f"[Scan] Found {len(sae_dirs)} SAE folders after filter.", flush=True)
+
     if args.verbose:
         for d in sae_dirs:
             print(f"  - {d}", flush=True)
 
-    def new_stream():
-        # Same distribution as training, skip head for held-out
-        return heldout_stream(
-            dataset=args.heldout_dataset,
-            skip_first_n_examples=args.skip_first_n_examples,
-        )
+    
 
     ############################################
     # Loop over each SAE, evaluate ΔLoss (mask & unmask)
@@ -1144,9 +1154,12 @@ def main():
                 json.dump(out_unmask, f, indent=2)
 
             print(
-                f"[Done] {d} → ΔLM(mask)={out_mask['delta_lm_loss(mask)']:.6f}  "
-                f"ΔLM(unmask)={out_unmask['delta_lm_loss(unmask)']:.6f}  "
-                f"masked_tokens={int(out_mask['tokens_masked_evaluated']):,}  "
+                f"[Done] {d} | "
+                f"delta_no_sae_noise(mask)={out_mask['delta_no_sae_noise(mask)']:.6f} | "
+                f"delta_yes_sae_noise(mask)={out_mask['delta_yes_sae_noise(mask)']:.6f} | "
+                f"delta_no_sae_noise(unmask)={out_unmask['delta_no_sae_noise(unmask)']:.6f} | "
+                f"delta_yes_sae_noise(unmask)={out_unmask['delta_yes_sae_noise(unmask)']:.6f} | "
+                f"masked_tokens={int(out_mask['tokens_masked_evaluated']):,} | "
                 f"unmasked_tokens={int(out_unmask['tokens_unmasked_evaluated']):,}",
                 flush=True,
             )
