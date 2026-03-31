@@ -1,0 +1,73 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Local install / editable install metadata
+*.egg
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# OS / misc
+Thumbs.db
+
+# PyTorch / model / checkpoint artifacts
+*.pt
+*.pth
+*.ckpt
+
+# Downloaded model / SAE artifacts
+downloaded_saes/
+
+# Autointerp outputs
+autointerp_hf/dream_mask_sae_interp_results/
+
+# Hugging Face / cache-style outputs if created locally
+.cache/
+hf_cache/
+huggingface/
+.huggingface/
+
+# Logs
+*.log
+
+# Environment files / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Generated config leftovers
+autointerp.toml
+
+# Optional: ignore local notebooks if you do not want exploratory files in git
+# *.ipynb
