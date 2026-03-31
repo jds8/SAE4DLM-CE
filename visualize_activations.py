@@ -327,7 +327,7 @@ def main() -> None:
     print("Loading activation tensor...")
     tensor, layers = load_data(args)
 
-    # Support both old [L, 3, F, T] and new [2, L, 3, F, T] tensor shapes.
+    # Support both old [L, 4, F, T] and new [2, L, 4, F, T] tensor shapes.
     if tensor.ndim == 4:
         tensor = tensor.unsqueeze(0)
         token_type_names = ["all"]

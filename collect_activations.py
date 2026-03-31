@@ -447,7 +447,7 @@ class LayerStatsAccumulator:
     separately for unmasked tokens and masked ([MASK]) tokens.
 
     Internal buffers have shape [F, T] per layer per statistic per token type.
-    Finalize() returns a tensor of shape [2, L, 3, F, T] where:
+    Finalize() returns a tensor of shape [2, L, 4, F, T] where:
         dim 0: token type  (0 = unmasked, 1 = masked)
         dim 1: layer index
         dim 2: statistic   (0 = all_token_avg, 1 = top_m_avg, 2 = activation_freq)
@@ -807,7 +807,7 @@ def main() -> None:
 
     print("Done.")
     print(f"Processed texts : {processed}")
-    print(f"Final tensor shape : {tuple(final_tensor.shape)}  (2 x L x 3 x F x T)")
+    print(f"Final tensor shape : {tuple(final_tensor.shape)}  (2 x L x 4 x F x T)")
     print(f"  dim 0: token type (0=unmasked, 1=masked)")
     print(f"Outputs written to : {args.out_dir}")
 
