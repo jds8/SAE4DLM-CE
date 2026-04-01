@@ -7,13 +7,15 @@ import argparse
 import warnings
 import inspect
 from typing import Iterable, List, Dict, Tuple, Optional, Any
+from pathlib import Path
+import re
 
 import torch as t
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 from tqdm import tqdm
 
-from dictionary_learning.dictionary_learning import utils
+from dictionary_learning import utils
 from dictionary_learning.trainers.top_k import AutoEncoderTopK
 
 ############################################
@@ -698,25 +700,43 @@ def heldout_stream(dataset: str, skip_first_n_examples: int = 0) -> Iterable[str
         yield txt
 
 
-def find_sae_trainer_dirs(root: str) -> List[str]:
+def find_sae_trainer_dirs(args) -> List[str]:
     """
     Any directory whose basename starts with 'trainer_' is treated
     as an SAE checkpoint directory. We return the absolute paths
     to those folders, sorted for reproducibility.
     """
     trainer_dirs: List[str] = []
+    root = args.ae_root
 
     # Walk the entire subtree under `root`
     for dirpath, dirnames, filenames in os.walk(root):
         base = os.path.basename(dirpath)
         # Check if this directory itself is a trainer directory
-        if base.startswith("trainer_") and os.path.isdir(dirpath):
-            trainer_dirs.append(dirpath)
+        layer_in_dir = any([f'layer_{i}' in dirpath for i in args.layers])
+        if base.startswith("trainer_") and os.path.isdir(dirpath) and layer_in_dir:
+            if Path(dirpath + '/config.json').is_file():
+                trainer_dirs.append(dirpath)
 
     # Sort so results are deterministic across runs
     trainer_dirs = sorted(trainer_dirs)
     return trainer_dirs
+    
 
+def find_layer_indices(root_dir):
+    """
+    Walk through all subdirectories of root_dir and return a list of integers i
+    such that a directory name contains 'layer_i'.
+    """
+    pattern = re.compile(r'layer_(\d+)')
+    indices = set()
+    for dirpath, dirnames, _ in os.walk(root_dir):
+        for dirname in dirnames:
+            matches = pattern.findall(dirname)
+            for match in matches:
+                indices.add(int(match))
+
+    return sorted(indices)
 
 ############################################
 # Main entry point
@@ -727,6 +747,8 @@ def main():
         "Compute Dream-ΔLoss (Delta LM loss for diffusion-like LMs) on a held-out slice."
     )
     parser.add_argument("--model_name", type=str, required=True)
+    parser.add_argument("--tokenizer_name", type=str, required=True)
+    parser.add_argument("--layers", type=int, nargs='+', default=-1)
     parser.add_argument("--ae_root", type=str, required=True)
     parser.add_argument("--token_budget", type=int, default=50_000_000)
     parser.add_argument("--batch_size_text", type=int, default=8)
@@ -780,6 +802,12 @@ def main():
     args = parser.parse_args()
 
     ############################################
+    # Handle layers
+    ############################################
+    if args.layers == -1:
+        args.layers = find_layer_indices(args.ae_root)
+
+    ############################################
     # Warnings / deprecations handling
     ############################################
     warnings.filterwarnings(
@@ -796,8 +824,9 @@ def main():
     # Tokenizer
     ############################################
     print(f"[Setup] Loading tokenizer for {args.model_name} ...", flush=True)
+    tokenizer_name = args.tokenizer_name if args.tokenizer_name else args.model_name
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name,
+        tokenizer_name,
         trust_remote_code=True,
         use_fast=True,
     )
@@ -852,7 +881,7 @@ def main():
     # Scan for all SAE checkpoints under ae_root
     ############################################
     print(f"[Scan] Scanning SAE folders under: {args.ae_root}", flush=True)
-    sae_dirs: List[str] = find_sae_trainer_dirs(args.ae_root)
+    sae_dirs: List[str] = find_sae_trainer_dirs(args)
     if len(sae_dirs) == 0:
         print(
             "[Scan] No trainer_* folders found via recursive scan. "
