@@ -1,6 +1,6 @@
 # eval_delta_lm_loss.py
 # -*- coding: utf-8 -*-
-# Experiment 2: untrained SAE
+
 import os
 import json
 import argparse
@@ -14,7 +14,7 @@ from transformers import AutoModel, AutoTokenizer
 from tqdm import tqdm
 
 from dictionary_learning.dictionary_learning import utils
-from dictionary_learning.trainers.top_k import AutoEncoderTopK
+
 
 ############################################
 # General helpers
@@ -728,6 +728,7 @@ def main():
     )
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument("--ae_root", type=str, required=True)
+    parser.add_argument("--tokenizer_name", type=str, default='')
     parser.add_argument("--token_budget", type=int, default=50_000_000)
     parser.add_argument("--batch_size_text", type=int, default=8)
     parser.add_argument("--max_len", type=int, default=2048)
@@ -796,8 +797,9 @@ def main():
     # Tokenizer
     ############################################
     print(f"[Setup] Loading tokenizer for {args.model_name} ...", flush=True)
+    tokenizer_name = args.tokenizer_name if args.tokenizer_name else args.model_name
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name,
+        tokenizer_name,
         trust_remote_code=True,
         use_fast=True,
     )
@@ -880,30 +882,7 @@ def main():
         print(f"\n[Eval {idx}/{len(sae_dirs)}] Loading SAE from: {d}", flush=True)
 
         try:
-            # dictionary, cfg = utils.load_dictionary(d, device=args.device)
-
-            # load trained SAE (for scaling only)
-            trained_dictionary, cfg = utils.load_dictionary(d, device=args.device)
-
-            # create untrained SAE
-            k = cfg["trainer"]["k"]
-            dictionary = AutoEncoderTopK(k=k)
-
-            # match scale
-            with t.no_grad():
-                dictionary.encoder.weight.copy_(
-                    dictionary.encoder.weight * trained_dictionary.encoder.weight.norm(dim=1, keepdim=True)
-                )
-                dictionary.decoder.weight.copy_(
-                    dictionary.decoder.weight * trained_dictionary.decoder.weight.norm(dim=0, keepdim=True)
-                )
-
-            # move to correct dtype/device
-            model_dtype = next(model.parameters()).dtype
-            dictionary.to(device=args.device, dtype=model_dtype)
-            dictionary.eval()
-
-
+            dictionary, cfg = utils.load_dictionary(d, device=args.device)
             model_dtype = next(model.parameters()).dtype
             dictionary.to(dtype=model_dtype)
             dictionary.eval()
@@ -1023,8 +1002,8 @@ def main():
             }
 
             # Save two files as requested
-            out_path_mask = os.path.join(d, "delta_lm_loss_random(mask).json")
-            out_path_unmask = os.path.join(d, "delta_lm_loss_random(unmask).json")
+            out_path_mask = os.path.join(d, "delta_lm_loss(mask).json")
+            out_path_unmask = os.path.join(d, "delta_lm_loss(unmask).json")
             with open(out_path_mask, "w") as f:
                 json.dump(out_mask, f, indent=2)
             with open(out_path_unmask, "w") as f:
