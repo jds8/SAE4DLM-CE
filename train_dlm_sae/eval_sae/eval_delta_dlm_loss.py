@@ -893,7 +893,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     ############################################
-    # Model
+    noise_std=args.noise_std# Model
     ############################################
     print("[Setup] Loading model (this can take minutes) ...", flush=True)
 
@@ -952,10 +952,20 @@ def main():
         except StopIteration:
             break
 
+    layer_stats = {}
+
     for layer_name in ["resid_post_layer_1", "resid_post_layer_10", "resid_post_layer_23"]:
         layer_idx = int(layer_name.split("_")[-1])
         stat_submodule = utils.get_submodule(model, layer_idx)
-        mean, std = compute_activation_stats(model, stat_submodule, tokenizer, stat_texts, max_len=args.max_len, device=t.device(args.device))
+        mean, std = compute_activation_stats(
+            model,
+            stat_submodule,
+            tokenizer,
+            stat_texts,
+            max_len=args.max_len,
+            device=t.device(args.device)
+        )
+        layer_stats[layer_idx] = {"mean": mean, "std": std}
         print(f"[Stats] {layer_name}: mean={mean:.4f}, std={std:.4f}", flush=True)
     ############################################
     # Scan for all SAE checkpoints under ae_root
@@ -974,7 +984,8 @@ def main():
 
     sae_dirs = [
         d for d in sae_dirs
-        if "/resid_post_layer_1/" in d and os.path.basename(d) == "trainer_0"
+        if any(f"/resid_post_layer_{l}/" in d for l in [1, 10, 23])
+        and os.path.basename(d) in [f"trainer_{i}" for i in range(5)]
     ]
 
     print(f"[Scan] Found {len(sae_dirs)} SAE folders after filter.", flush=True)
@@ -999,6 +1010,8 @@ def main():
 
             layer = cfg["trainer"]["layer"]
             submodule = utils.get_submodule(model, layer)
+            layer_std = layer_stats[layer]["std"]
+            noise_std = 0.3 * layer_std
             print(f"[Eval] Target layer = {layer} | io = {args.io}", flush=True)
 
             # Aggregators (sums over tokens, then averaged at the end)
@@ -1052,8 +1065,8 @@ def main():
                     t_max=args.t_max,
                     fixed_t=args.fixed_t,  # None -> random t ~ U[t_min, t_max]
                     verbose=args.verbose,
+                    noise_std=noise_std,
                     #ADDED
-                    noise_std=args.noise_std,
                 )
                 #ADDED
                 # Accumulate mask-only
