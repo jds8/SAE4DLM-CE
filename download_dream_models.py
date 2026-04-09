@@ -25,9 +25,6 @@ for f in files:
 model_paths = ["Dream-org/Dream-v0-Base-7B", "GSAI-ML/LLaDA-8B-Base"]
 model_names = ["dream", "llada"]
 
-model_paths = ["GSAI-ML/LLaDA-8B-Base"]
-model_names = ["llada"]
-
 for model_path, model_name in zip(model_paths, model_names):
     model = AutoModel.from_pretrained(
         model_path,
