@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 from tqdm import tqdm
 
-from dictionary_learning.dictionary_learning import utils
+from dictionary_learning import utils
 
 
 ############################################
@@ -349,7 +349,7 @@ def register_sae_splice_hook(submodule: t.nn.Module, dictionary: t.nn.Module, io
     else:
         raise ValueError("io must be 'in' or 'out'")
 # ADDED
-def register_noise_hook(submodule: t.nn.Module, noise_std: float, seed: int = 42, io: str = "out"):
+def register_noise_hook(submodule: t.nn.Module, noise_std: float, generator: List, io: str = "out"):
     """
     Register a hook that adds Gaussian noise to activations at a given submodule.
     noise_std: scale of the noise, should match empirical activation statistics.
@@ -360,8 +360,6 @@ def register_noise_hook(submodule: t.nn.Module, noise_std: float, seed: int = 42
             act = _first_tensor(output)
             if act is None:
                 return output
-            generator = t.Generator(device=act.device)
-            generator.manual_seed(seed)
             noisy_act = act + t.randn(act.shape, generator=generator, device=act.device, dtype=act.dtype) * noise_std
 
             
@@ -605,6 +603,7 @@ def dlm_batch_losses(
     max_len: int,
     mask_token_id: int,
     device: t.device,
+    generators: List,
     io: str = "out",
     t_min: float = 0.05,
     t_max: float = 0.50,
@@ -679,7 +678,7 @@ def dlm_batch_losses(
         handle.remove()
     # ADDED
     # 5) no_sae noisy forward
-    noise_handle = register_noise_hook(submodule, noise_std, seed=42, io=io)
+    noise_handle = register_noise_hook(submodule, noise_std, generators[0], io=io)
     try:
         outputs_noisy = _safe_forward_with_masks(model, base_inputs, prefer_additive=True)
         logits_noisy = get_logits(outputs_noisy)
@@ -687,7 +686,7 @@ def dlm_batch_losses(
         noise_handle.remove()
 
     # 6) yes_sae_noisy forward (noise first, then SAE)
-    noise_handle = register_noise_hook(submodule, noise_std, seed=42, io=io)
+    noise_handle = register_noise_hook(submodule, noise_std, generators[1], io=io)
     sae_handle = register_sae_splice_hook(submodule, dictionary, io=io)
     try:
         outputs_sae_noisy = _safe_forward_with_masks(model, base_inputs, prefer_additive=True)
@@ -1030,6 +1029,14 @@ def main():
             loss_clean_noisy_unmask_sum_total = 0.0
             loss_sae_noisy_unmask_sum_total   = 0.0
 
+            device=t.device(args.device if ("cuda" in args.device or "cpu" in args.device) else "cpu"),
+
+            generators = []
+            for g in range(2):
+                generator = t.Generator()
+                generator.manual_seed(42)
+                generators.append(generator)
+
             stream = new_stream()
 
             pbar = tqdm(
@@ -1059,7 +1066,8 @@ def main():
                     texts=texts,
                     max_len=args.max_len,
                     mask_token_id=mask_token_id,
-                    device=t.device(args.device if ("cuda" in args.device or "cpu" in args.device) else "cpu"),
+                    device=device,
+                    generators=generators,
                     io=args.io,
                     t_min=args.t_min,
                     t_max=args.t_max,
