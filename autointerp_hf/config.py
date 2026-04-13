@@ -77,18 +77,15 @@ class AutoInterpEvalConfig:
         Resolve which latents we plan to interpret:
         - If override_latents is provided, use exactly those (and set n_latents accordingly).
         - Otherwise, n_latents stays as-is, we will later randomly sample that many alive latents.
+        Note: override_latents takes priority to handle dataclasses.replace() re-invoking __post_init__.
         """
-        if self.n_latents is None:
-            assert self.override_latents is not None, (
-                "If n_latents is None you must supply override_latents."
-            )
+        if self.override_latents is not None:
             self.latents = self.override_latents
             self.n_latents = len(self.latents)
-        else:
-            assert self.override_latents is None, (
-                "You cannot set both n_latents and override_latents."
-            )
+        elif self.n_latents is not None:
             self.latents = None
+        else:
+            raise AssertionError("Either n_latents or override_latents must be provided.")
 
     # ------------- convenience properties -------------
 
