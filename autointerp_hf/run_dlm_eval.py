@@ -312,66 +312,96 @@ async def run_single_sae_and_save(
         tokenizer=tokenizer,
     )
 
-    activation_counts = sparsity * cfg_local.total_tokens
-    alive_latents = (
-        torch.nonzero(activation_counts > cfg_local.dead_latent_threshold).squeeze(1).tolist()
-    )
-    if len(alive_latents) == 0:
-        print("[WARN] No alive latents; skipping this SAE.")
-        return
-
-    need_total = cfg_local.n_latents
-    already = len(already_done)
-    if already >= need_total:
-        print(f"[INFO] Checkpoint has {already} latents >= requested {need_total}; finalizing...")
-        sae_metadata = {
-            "sae_path": sae_pt_path,
-            "hook_module_path": cfg_local.hook_module_path,
-        }
-        eval_output = build_eval_output(
-            eval_config={"cfg": cfg_local.__dict__},
-            model_name_or_path=cfg_local.model_name_or_path,
-            hook_module_path=cfg_local.hook_module_path,
-            sae_metadata=sae_metadata,
-            results_dict=partial_results,
+    # If override_latents is set, skip dead-latent filtering and use exactly those indices.
+    if cfg_local.override_latents is not None:
+        print(f"[INFO] override_latents set; skipping dead-latent filter. Using: {cfg_local.override_latents}")
+        need_total = cfg_local.n_latents
+        already = len(already_done)
+        if already >= need_total:
+            print(f"[INFO] Checkpoint has {already} latents >= requested {need_total}; finalizing...")
+            sae_metadata = {
+                "sae_path": sae_pt_path,
+                "hook_module_path": cfg_local.hook_module_path,
+            }
+            eval_output = build_eval_output(
+                eval_config={"cfg": cfg_local.__dict__},
+                model_name_or_path=cfg_local.model_name_or_path,
+                hook_module_path=cfg_local.hook_module_path,
+                sae_metadata=sae_metadata,
+                results_dict=partial_results,
+            )
+            atomic_json_write(final_out_path, eval_output)
+            try:
+                os.remove(ckpt_path)
+            except FileNotFoundError:
+                pass
+            print(f"[DONE] Saved eval results to {final_out_path}")
+            metrics = eval_output.get("metrics", {})
+            print(f"[INFO] Mean AutoInterp score = {metrics.get('autointerp_score', 0.0):.4f}, "
+                  f"StdDev = {metrics.get('autointerp_std_dev', 0.0):.4f}")
+            return
+        latents_to_run = [i for i in cfg_local.override_latents if i not in already_done]
+    else:
+        activation_counts = sparsity * cfg_local.total_tokens
+        alive_latents = (
+            torch.nonzero(activation_counts > cfg_local.dead_latent_threshold).squeeze(1).tolist()
         )
-        atomic_json_write(final_out_path, eval_output)
-        try:
-            os.remove(ckpt_path)
-        except FileNotFoundError:
-            pass
-        print(f"[DONE] Saved eval results to {final_out_path}")
-        metrics = eval_output.get("metrics", {})
-        print(f"[INFO] Mean AutoInterp score = {metrics.get('autointerp_score', 0.0):.4f}, "
-              f"StdDev = {metrics.get('autointerp_std_dev', 0.0):.4f}")
-        return
+        if len(alive_latents) == 0:
+            print("[WARN] No alive latents; skipping this SAE.")
+            return
 
-    remaining_needed = need_total - already
-    candidates = [i for i in alive_latents if i not in already_done]
-    if len(candidates) == 0:
-        print("[WARN] No remaining alive latents to evaluate; finalizing what we have.")
-        sae_metadata = {
-            "sae_path": sae_pt_path,
-            "hook_module_path": cfg_local.hook_module_path,
-        }
-        eval_output = build_eval_output(
-            eval_config={"cfg": cfg_local.__dict__},
-            model_name_or_path=cfg_local.model_name_or_path,
-            hook_module_path=cfg_local.hook_module_path,
-            sae_metadata=sae_metadata,
-            results_dict=partial_results,
-        )
-        atomic_json_write(final_out_path, eval_output)
-        try:
-            os.remove(ckpt_path)
-        except FileNotFoundError:
-            pass
-        print(f"[DONE] Saved eval results to {final_out_path}")
-        return
+        need_total = cfg_local.n_latents
+        already = len(already_done)
+        if already >= need_total:
+            print(f"[INFO] Checkpoint has {already} latents >= requested {need_total}; finalizing...")
+            sae_metadata = {
+                "sae_path": sae_pt_path,
+                "hook_module_path": cfg_local.hook_module_path,
+            }
+            eval_output = build_eval_output(
+                eval_config={"cfg": cfg_local.__dict__},
+                model_name_or_path=cfg_local.model_name_or_path,
+                hook_module_path=cfg_local.hook_module_path,
+                sae_metadata=sae_metadata,
+                results_dict=partial_results,
+            )
+            atomic_json_write(final_out_path, eval_output)
+            try:
+                os.remove(ckpt_path)
+            except FileNotFoundError:
+                pass
+            print(f"[DONE] Saved eval results to {final_out_path}")
+            metrics = eval_output.get("metrics", {})
+            print(f"[INFO] Mean AutoInterp score = {metrics.get('autointerp_score', 0.0):.4f}, "
+                  f"StdDev = {metrics.get('autointerp_std_dev', 0.0):.4f}")
+            return
 
-    k = min(remaining_needed, len(candidates))
-    random.shuffle(candidates)
-    latents_to_run = candidates[:k]
+        remaining_needed = need_total - already
+        candidates = [i for i in alive_latents if i not in already_done]
+        if len(candidates) == 0:
+            print("[WARN] No remaining alive latents to evaluate; finalizing what we have.")
+            sae_metadata = {
+                "sae_path": sae_pt_path,
+                "hook_module_path": cfg_local.hook_module_path,
+            }
+            eval_output = build_eval_output(
+                eval_config={"cfg": cfg_local.__dict__},
+                model_name_or_path=cfg_local.model_name_or_path,
+                hook_module_path=cfg_local.hook_module_path,
+                sae_metadata=sae_metadata,
+                results_dict=partial_results,
+            )
+            atomic_json_write(final_out_path, eval_output)
+            try:
+                os.remove(ckpt_path)
+            except FileNotFoundError:
+                pass
+            print(f"[DONE] Saved eval results to {final_out_path}")
+            return
+
+        k = min(remaining_needed, len(candidates))
+        random.shuffle(candidates)
+        latents_to_run = candidates[:k]
 
     meta = {
         "sae_path": sae_pt_path,
@@ -459,12 +489,14 @@ async def main(args):
     no_demos = getattr(args, "no_demos", False)
     debug_judge = getattr(args, "debug_judge", False)
 
+    override_latents = getattr(args, "override_latents", None)
     cfg = AutoInterpEvalConfig(
         model_name_or_path=args.model_name_or_path,
         hook_module_path=args.hook_module_path,
         device=args.device,
         torch_dtype=args.torch_dtype,
-        n_latents=args.n_latents,
+        n_latents=None if override_latents else args.n_latents,
+        override_latents=override_latents,
         dead_latent_threshold=args.dead_latent_threshold,
         dataset_name=args.dataset_name,
         total_tokens=args.total_tokens,
@@ -576,6 +608,14 @@ def build_arg_parser():
     p.add_argument("--batch_size", type=int, default=32)
 
     p.add_argument("--n_latents", type=int, default=100)
+    p.add_argument(
+        "--override_latents",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit latent indices to evaluate. Mutually exclusive with --n_latents. "
+             "Skips the dead-latent threshold filter.",
+    )
     p.add_argument("--dead_latent_threshold", type=float, default=15)
 
     p.add_argument(
