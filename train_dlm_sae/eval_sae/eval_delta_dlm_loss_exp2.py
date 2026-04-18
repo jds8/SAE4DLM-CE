@@ -537,8 +537,12 @@ def ce_sum_with_mask(
 
     if not isinstance(logits, t.Tensor):
         raise RuntimeError(f"ce_sum_with_mask expected logits as Tensor but got {type(logits)}")
+    # Ensure inputs are dynamically aligned with wherever device_map placed the logits
+    labels = labels.to(logits.device)
+    mask = mask.to(logits.device)
 
     per_tok_loss = F.cross_entropy(logits[mask], labels[mask], reduction="none")  # (n,)
+    
     if weight_scalar is not None:
         per_tok_loss = per_tok_loss * float(weight_scalar)
     loss_sum = per_tok_loss.sum()
@@ -883,38 +887,41 @@ def main():
             # dictionary, cfg = utils.load_dictionary(d, device=args.device)
 
             # load trained SAE (for scaling only)
-            trained_dictionary, cfg = utils.load_dictionary(d, device=args.device)
+            dictionary, cfg = utils.load_dictionary(d, device="cpu")  # load on CPU first
 
-            k = cfg["trainer"]["k"]
-
-            # get dimensions from trained SAE
-            dict_size, activation_dim = trained_dictionary.encoder.weight.shape
-
-            # create untrained SAE with correct shape
-            dictionary = AutoEncoderTopK(
-                dict_size=dict_size,
-                activation_dim=activation_dim,
-                k=k
-            )
-
-            # match scale
-            with t.no_grad():
-                dictionary.encoder.weight.copy_(
-                    dictionary.encoder.weight * trained_dictionary.encoder.weight.norm(dim=1, keepdim=True)
-                )
-                dictionary.decoder.weight.copy_(
-                    dictionary.decoder.weight * trained_dictionary.decoder.weight.norm(dim=0, keepdim=True)
-                )
-
-            # move to correct dtype/device
             model_dtype = next(model.parameters()).dtype
+
+            # Move EVERYTHING cleanly to GPU
+            dictionary = dictionary.to(args.device)
+            dictionary = dictionary.to(dtype=model_dtype)
+
+            # Move registered parameters/buffers cleanly to GPU
             dictionary.to(device=args.device, dtype=model_dtype)
+
+            # Recursively hunt down and move unregistered/hidden tensors
+            def _force_move_all_tensors(obj, target_device, target_dtype):
+                if hasattr(obj, "__dict__"):
+                    for k, v in vars(obj).items():
+                        # Catch standalone tensors
+                        if isinstance(v, t.Tensor):
+                            setattr(obj, k, v.to(device=target_device, dtype=target_dtype))
+                        # Catch nested modules (like sub-encoders)
+                        elif isinstance(v, t.nn.Module) and v is not obj:
+                            _force_move_all_tensors(v, target_device, target_dtype)
+                        # Catch tensors hiding in lists/tuples
+                        elif isinstance(v, (list, tuple)):
+                            new_v = [
+                                item.to(device=target_device, dtype=target_dtype) if isinstance(item, t.Tensor) else item 
+                                for item in v
+                            ]
+                            setattr(obj, k, type(v)(new_v))
+
+            _force_move_all_tensors(dictionary, args.device, model_dtype)
+
             dictionary.eval()
 
-
-            model_dtype = next(model.parameters()).dtype
-            dictionary.to(dtype=model_dtype)
-            dictionary.eval()
+            print("Model device:", next(model.parameters()).device)
+            print("SAE device:", next(dictionary.parameters()).device)
 
             layer = cfg["trainer"]["layer"]
             submodule = utils.get_submodule(model, layer)
