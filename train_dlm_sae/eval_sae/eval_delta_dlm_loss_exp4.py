@@ -7,6 +7,7 @@ import argparse
 import warnings
 import inspect
 from typing import Iterable, List, Dict, Tuple, Optional, Any
+from xml.parsers.expat import model
 
 import torch as t
 import torch.nn.functional as F
@@ -347,9 +348,52 @@ def register_sae_splice_hook(submodule: t.nn.Module, dictionary: t.nn.Module, io
 
     else:
         raise ValueError("io must be 'in' or 'out'")
+# ADDED
+def register_noise_hook(submodule: t.nn.Module, noise_std: float, generator: List, io: str = "out"):
+    """
+    Register a hook that adds Gaussian noise to activations at a given submodule.
+    noise_std: scale of the noise, should match empirical activation statistics.
+    seed: fixed seed so identical noise is added across no_sae and yes_sae conditions.
+    """
+    if io == "out":
+        def _hook(_, __, output):
+            act = _first_tensor(output)
+            if act is None:
+                return output
+            noisy_act = act + t.randn(act.shape, generator=generator, device=act.device, dtype=act.dtype) * noise_std
+
+            
+            return _replace_first_tensor(output, noisy_act)
+        return submodule.register_forward_hook(_hook)
+    else:
+        raise ValueError("io must be 'in' or 'out'")
+    
+# ADDED
 
 
-############################################
+
+def compute_activation_stats(model, submodule, tokenizer, texts: List[str], max_len: int, device: t.device, io: str = "out"):
+    activations = []
+
+    if io == "out":
+        def _hook(_, __, output):
+            act = _first_tensor(output)
+            activations.append(act.detach().cpu())
+            return output
+
+        handle = submodule.register_forward_hook(_hook)
+        try: 
+            batch = tokenize_batch(tokenizer, texts, max_len=max_len, device=device)
+            _safe_forward_with_masks(model, batch, prefer_additive=True)
+        finally:
+            handle.remove()
+    all_acts = t.cat(activations)
+    mean = all_acts.mean().item()
+    std = all_acts.std().item()
+    return mean, std
+
+    
+########################################
 # Tokenization / masking / timestep helpers
 ############################################
 
@@ -559,11 +603,13 @@ def dlm_batch_losses(
     max_len: int,
     mask_token_id: int,
     device: t.device,
+    generators: List,
     io: str = "out",
     t_min: float = 0.05,
     t_max: float = 0.50,
     fixed_t: Optional[float] = None,
     verbose: bool = False,
+    noise_std: float = 1.0,
 ) -> Dict[str, t.Tensor]:
     """
     For a batch of texts, evaluate two ΔLM losses:
@@ -585,6 +631,7 @@ def dlm_batch_losses(
         t_prob = float(fixed_t)
     else:
         t_prob = float(t.empty((), device=device).uniform_(t_min, t_max).item())
+    print('passed empty()')
     t_prob = max(1e-6, min(0.999, t_prob))  # clamp for safety
     inv_t_weight = 1.0 / t_prob
     inv_unmask_weight = 1.0 / max(1e-6, (1.0 - t_prob))
@@ -618,22 +665,47 @@ def dlm_batch_losses(
     base_inputs = {"input_ids": masked_ids, "attention_mask": attention_mask}
     base_inputs = _maybe_add_time_condition(base_inputs, p_scalar=t_prob, model=model)
 
-    # 3) clean forward
+    # 3) no_sae no_noise forward
     outputs_clean = _safe_forward_with_masks(model, base_inputs, prefer_additive=True)
     logits_clean = get_logits(outputs_clean)
 
-    # 4) SAE forward (splice)
+
+    # 4) sae no_noise forward (splice)
     handle = register_sae_splice_hook(submodule, dictionary, io=io)
     try:
         outputs_sae = _safe_forward_with_masks(model, base_inputs, prefer_additive=True)
         logits_sae = get_logits(outputs_sae)
     finally:
         handle.remove()
+    # ADDED
+    # 5) no_sae noisy forward
+    noise_handle = register_noise_hook(submodule, noise_std, generators[0], io=io)
+    try:
+        outputs_noisy = _safe_forward_with_masks(model, base_inputs, prefer_additive=True)
+        logits_noisy = get_logits(outputs_noisy)
+    finally:
+        noise_handle.remove()
+
+    # 6) yes_sae_noisy forward (noise first, then SAE)
+    noise_handle = register_noise_hook(submodule, noise_std, generators[1], io=io)
+    sae_handle = register_sae_splice_hook(submodule, dictionary, io=io)
+    try:
+        outputs_sae_noisy = _safe_forward_with_masks(model, base_inputs, prefer_additive=True)
+        logits_sae_noisy = get_logits(outputs_sae_noisy)
+    finally:
+        sae_handle.remove()
+        noise_handle.remove()
+    
+
 
     # --- A) mask-only ---
     loss_clean_mask_sum, n_mask = ce_sum_with_mask(logits_clean, input_ids, m, weight_scalar=inv_t_weight)
     loss_sae_mask_sum, _       = ce_sum_with_mask(logits_sae,   input_ids, m, weight_scalar=inv_t_weight)
 
+    loss_clean_noisy_mask_sum, n_noisy_mask = ce_sum_with_mask(logits_noisy, input_ids, m, weight_scalar=inv_t_weight)
+    loss_sae_noisy_mask_sum, _       = ce_sum_with_mask(logits_sae_noisy,   input_ids, m, weight_scalar=inv_t_weight)
+
+    
     # --- B) unmask-only ---
     loss_clean_unmask_sum, n_unmask = ce_sum_with_mask(
         logits_clean, input_ids, unmask_sel, weight_scalar=inv_unmask_weight
@@ -641,6 +713,11 @@ def dlm_batch_losses(
     loss_sae_unmask_sum, _ = ce_sum_with_mask(
         logits_sae, input_ids, unmask_sel, weight_scalar=inv_unmask_weight
     )
+    # ADDED
+    loss_clean_noisy_unmask_sum, n_noisy_unmask = ce_sum_with_mask(logits_noisy, input_ids, unmask_sel, weight_scalar=inv_unmask_weight)
+    loss_sae_noisy_unmask_sum, _       = ce_sum_with_mask(logits_sae_noisy,   input_ids, unmask_sel, weight_scalar=inv_unmask_weight)
+
+
 
     if verbose:
         B, T = input_ids.shape
@@ -657,10 +734,17 @@ def dlm_batch_losses(
         "loss_clean_mask_sum": loss_clean_mask_sum,
         "loss_sae_mask_sum": loss_sae_mask_sum,
         "n_masked_tokens": t.tensor(n_mask, device=device),
+        
+        "loss_clean_noisy_mask_sum": loss_clean_noisy_mask_sum,
+        "loss_sae_noisy_mask_sum": loss_sae_noisy_mask_sum,
+        "n_noisy_masked_tokens": t.tensor(n_noisy_mask, device=device),
         # unmask-only sums + count
         "loss_clean_unmask_sum": loss_clean_unmask_sum,
         "loss_sae_unmask_sum": loss_sae_unmask_sum,
         "n_unmasked_tokens": t.tensor(n_unmask, device=device),
+        "loss_clean_noisy_unmask_sum": loss_clean_noisy_unmask_sum,
+        "loss_sae_noisy_unmask_sum": loss_sae_noisy_unmask_sum,
+        "n_noisy_unmasked_tokens": t.tensor(n_noisy_unmask, device=device),
         # bookkeeping
         "t_used": t.tensor(t_prob, device=device, dtype=t.float32),
     }
@@ -739,6 +823,8 @@ def main():
         default="bfloat16",
         choices=["float32", "bfloat16", "float16"],
     )
+    parser.add_argument("--noise_std", type=float, default=1.0,
+                    help="Standard deviation of Gaussian noise injected into activations.")
 
     # IMPORTANT: same distribution as SAE training
     parser.add_argument(
@@ -807,7 +893,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     ############################################
-    # Model
+    noise_std=args.noise_std# Model
     ############################################
     print("[Setup] Loading model (this can take minutes) ...", flush=True)
 
@@ -849,7 +935,38 @@ def main():
             f"[Info] tokenizer.mask_token_id not found; using fallback id = {mask_token_id}",
             flush=True,
         )
+    #ADDED
+    def new_stream():
+        # Same distribution as training, skip head for held-out
+        return heldout_stream(
+            dataset=args.heldout_dataset,
+            skip_first_n_examples=args.skip_first_n_examples,
+        )
 
+    print("[Setup] Computing activation statistics...", flush=True)
+    stat_texts = []
+    stream = new_stream()
+    for _ in range(4): 
+        try:
+            stat_texts.append(next(stream))
+        except StopIteration:
+            break
+
+    layer_stats = {}
+
+    layer_idxs = [5, 14, 27]
+    for layer_idx in layer_idxs:
+        stat_submodule = utils.get_submodule(model, layer_idx)
+        mean, std = compute_activation_stats(
+            model,
+            stat_submodule,
+            tokenizer,
+            stat_texts,
+            max_len=args.max_len,
+            device=t.device(args.device)
+        )
+        layer_stats[layer_idx] = {"mean": mean, "std": std}
+        print(f"[Stats] Layer {layer_idx}: mean={mean:.4f}, std={std:.4f}", flush=True)
     ############################################
     # Scan for all SAE checkpoints under ae_root
     ############################################
@@ -863,17 +980,21 @@ def main():
         )
         sae_dirs = utils.get_nested_folders(args.ae_root)
 
-    print(f"[Scan] Found {len(sae_dirs)} SAE folders.", flush=True)
+    print(f"[Scan] Found {len(sae_dirs)} SAE folders before filter.", flush=True)
+
+    sae_dirs = [
+        d for d in sae_dirs
+        if any(f"/resid_post_layer_{l}/" in d for l in [5, 14, 27])
+        and os.path.basename(d) in [f"trainer_{i}" for i in range(5)]
+    ]
+
+    print(f"[Scan] Found {len(sae_dirs)} SAE folders after filter.", flush=True)
+
     if args.verbose:
         for d in sae_dirs:
             print(f"  - {d}", flush=True)
 
-    def new_stream():
-        # Same distribution as training, skip head for held-out
-        return heldout_stream(
-            dataset=args.heldout_dataset,
-            skip_first_n_examples=args.skip_first_n_examples,
-        )
+    
 
     ############################################
     # Loop over each SAE, evaluate ΔLoss (mask & unmask)
@@ -889,6 +1010,8 @@ def main():
 
             layer = cfg["trainer"]["layer"]
             submodule = utils.get_submodule(model, layer)
+            layer_std = layer_stats[layer]["std"]
+            noise_std = 0.3 * layer_std
             print(f"[Eval] Target layer = {layer} | io = {args.io}", flush=True)
 
             # Aggregators (sums over tokens, then averaged at the end)
@@ -900,6 +1023,20 @@ def main():
 
             loss_clean_unmask_sum_total = 0.0
             loss_sae_unmask_sum_total   = 0.0
+            #ADDED
+            loss_clean_noisy_mask_sum_total = 0.0
+            loss_sae_noisy_mask_sum_total   = 0.0
+
+            loss_clean_noisy_unmask_sum_total = 0.0
+            loss_sae_noisy_unmask_sum_total   = 0.0
+
+            device=t.device(args.device if ("cuda" in args.device or "cpu" in args.device) else "cpu")
+
+            generators = []
+            for g in range(2):
+                generator = t.Generator(device=device)
+                generator.manual_seed(42)
+                generators.append(generator)
 
             stream = new_stream()
 
@@ -930,19 +1067,24 @@ def main():
                     texts=texts,
                     max_len=args.max_len,
                     mask_token_id=mask_token_id,
-                    device=t.device(args.device if ("cuda" in args.device or "cpu" in args.device) else "cpu"),
+                    device=device,
+                    generators=generators,
                     io=args.io,
                     t_min=args.t_min,
                     t_max=args.t_max,
                     fixed_t=args.fixed_t,  # None -> random t ~ U[t_min, t_max]
                     verbose=args.verbose,
+                    noise_std=noise_std,
+                    #ADDED
                 )
-
+                #ADDED
                 # Accumulate mask-only
                 n_mask = int(batch_losses["n_masked_tokens"].item())
                 if n_mask > 0:
                     loss_clean_mask_sum_total += float(batch_losses["loss_clean_mask_sum"].item())
                     loss_sae_mask_sum_total   += float(batch_losses["loss_sae_mask_sum"].item())
+                    loss_clean_noisy_mask_sum_total += float(batch_losses["loss_clean_noisy_mask_sum"].item())
+                    loss_sae_noisy_mask_sum_total   += float(batch_losses["loss_sae_noisy_mask_sum"].item())
                     sum_masked_tokens         += n_mask
                     pbar.update(n_mask)
 
@@ -951,6 +1093,8 @@ def main():
                 if n_unmask > 0:
                     loss_clean_unmask_sum_total += float(batch_losses["loss_clean_unmask_sum"].item())
                     loss_sae_unmask_sum_total   += float(batch_losses["loss_sae_unmask_sum"].item())
+                    loss_clean_noisy_unmask_sum_total += float(batch_losses["loss_clean_noisy_unmask_sum"].item())
+                    loss_sae_noisy_unmask_sum_total   += float(batch_losses["loss_sae_noisy_unmask_sum"].item())
                     sum_unmasked_tokens         += n_unmask
 
             pbar.close()
@@ -963,12 +1107,24 @@ def main():
             avg_clean_mask = loss_clean_mask_sum_total / sum_masked_tokens
             avg_sae_mask   = loss_sae_mask_sum_total   / sum_masked_tokens
             delta_mask     = avg_sae_mask - avg_clean_mask
+            #ADDED
+            avg_clean_noisy_mask = loss_clean_noisy_mask_sum_total / sum_masked_tokens
+            avg_sae_noisy_mask   = loss_sae_noisy_mask_sum_total   / sum_masked_tokens
+            delta_no_sae_noise_mask  = avg_clean_noisy_mask - avg_clean_mask
+            delta_yes_sae_noise_mask = avg_sae_noisy_mask - avg_sae_mask
+
+
 
             out_mask = {
                 "tokens_masked_evaluated": float(sum_masked_tokens),
                 "dream_weighted_loss_clean(mask)": float(avg_clean_mask),
                 "dream_weighted_loss_sae(mask)": float(avg_sae_mask),
                 "delta_lm_loss(mask)": float(delta_mask),
+                #ADDED
+                "dream_weighted_loss_clean_noisy(mask)": float(avg_clean_noisy_mask),
+                "dream_weighted_loss_sae_noisy(mask)": float(avg_sae_noisy_mask),
+                "delta_no_sae_noise(mask)": float(delta_no_sae_noise_mask),
+                "delta_yes_sae_noise(mask)": float(delta_yes_sae_noise_mask),
                 "weighting": "mask-only CE weighted by 1/t",
                 "t_min": float(args.t_min),
                 "t_max": float(args.t_max),
@@ -984,12 +1140,22 @@ def main():
             avg_clean_unmask = loss_clean_unmask_sum_total / sum_unmasked_tokens
             avg_sae_unmask   = loss_sae_unmask_sum_total   / sum_unmasked_tokens
             delta_unmask     = avg_sae_unmask - avg_clean_unmask
+            #ADDED
+            avg_clean_noisy_unmask = loss_clean_noisy_unmask_sum_total / sum_unmasked_tokens
+            avg_sae_noisy_unmask   = loss_sae_noisy_unmask_sum_total   / sum_unmasked_tokens
+            delta_no_sae_noise_unmask  = avg_clean_noisy_unmask - avg_clean_unmask
+            delta_yes_sae_noise_unmask = avg_sae_noisy_unmask - avg_sae_unmask
 
+            #ADDED
             out_unmask = {
                 "tokens_unmasked_evaluated": float(sum_unmasked_tokens),
                 "dream_weighted_loss_clean(unmask)": float(avg_clean_unmask),
                 "dream_weighted_loss_sae(unmask)": float(avg_sae_unmask),
                 "delta_lm_loss(unmask)": float(delta_unmask),
+                "dream_weighted_loss_clean_noisy(unmask)": float(avg_clean_noisy_unmask),
+                "dream_weighted_loss_sae_noisy(unmask)": float(avg_sae_noisy_unmask),
+                "delta_no_sae_noise(unmask)": float(delta_no_sae_noise_unmask),
+                "delta_yes_sae_noise(unmask)": float(delta_yes_sae_noise_unmask),
                 "weighting": "unmask-only CE weighted by 1/(1 - t), first token excluded",
                 "t_min": float(args.t_min),
                 "t_max": float(args.t_max),
@@ -1002,22 +1168,26 @@ def main():
             }
 
             # Save two files as requested
-            out_path_mask = os.path.join(d, "og_delta_lm_loss(mask).json")
-            out_path_unmask = os.path.join(d, "og_delta_lm_loss(unmask).json")
+            out_path_mask = os.path.join(d, "delta_lm_loss(mask).json")
+            out_path_unmask = os.path.join(d, "delta_lm_loss(unmask).json")
             with open(out_path_mask, "w") as f:
                 json.dump(out_mask, f, indent=2)
             with open(out_path_unmask, "w") as f:
                 json.dump(out_unmask, f, indent=2)
 
             print(
-                f"[Done] {d} → ΔLM(mask)={out_mask['delta_lm_loss(mask)']:.6f}  "
-                f"ΔLM(unmask)={out_unmask['delta_lm_loss(unmask)']:.6f}  "
-                f"masked_tokens={int(out_mask['tokens_masked_evaluated']):,}  "
+                f"[Done] {d} | "
+                f"delta_no_sae_noise(mask)={out_mask['delta_no_sae_noise(mask)']:.6f} | "
+                f"delta_yes_sae_noise(mask)={out_mask['delta_yes_sae_noise(mask)']:.6f} | "
+                f"delta_no_sae_noise(unmask)={out_unmask['delta_no_sae_noise(unmask)']:.6f} | "
+                f"delta_yes_sae_noise(unmask)={out_unmask['delta_yes_sae_noise(unmask)']:.6f} | "
+                f"masked_tokens={int(out_mask['tokens_masked_evaluated']):,} | "
                 f"unmasked_tokens={int(out_unmask['tokens_unmasked_evaluated']):,}",
                 flush=True,
             )
 
         except Exception as e:
+            import pdb; pdb.set_trace()
             print(f"[Eval] Failed on {d}: {e}", flush=True)
 
 

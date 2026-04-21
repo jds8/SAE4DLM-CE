@@ -82,6 +82,9 @@ def get_args():
         "--mixed_dataset", action="store_true",
         help="Use a mixed dataset pipeline (only if you know what you are doing)."
     )
+    parser.add_argument(
+        "--dataset", type=str, default="monology/pile-uncopyrighted"
+    )
 
     # ---------------- NEW: DLM forward-noising arguments ----------------
     parser.add_argument(
@@ -173,12 +176,20 @@ def _load_model_and_tokenizer(model_name: str, dtype):
     if not hasattr(tok, "pad_token") or tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    model = AutoModel.from_pretrained(
-        model_name,
-        trust_remote_code=True,  # required for Dream models
-        device_map="auto",
-        dtype=dtype              # avoid deprecated torch_dtype
-    )
+    try:
+        model = AutoModel.from_pretrained(
+            model_name,
+            trust_remote_code=True,  # required for Dream models
+            device_map="auto",
+            dtype=dtype              # avoid deprecated torch_dtype
+        )
+    except:
+        model = AutoModel.from_pretrained(
+            model_name,
+            trust_remote_code=True,  # required for Dream models
+            device_map="auto",
+            torch_dtype=dtype              # use torch_dtype
+        )
     model.eval()
     return model, tok
 
@@ -425,6 +436,7 @@ def eval_saes(
     ae_paths: list[str],
     n_inputs: int,
     device: str,
+    dataset: str,
     overwrite_prev_results: bool = False,
     transcoder: bool = False,
 ) -> dict:
@@ -464,7 +476,7 @@ def eval_saes(
     buffer_size = n_inputs
     n_batches = max(1, n_inputs // loss_recovered_batch_size)
 
-    generator = hf_dataset_to_generator("monology/pile-uncopyrighted")
+    generator = hf_dataset_to_generator(dataset)
 
     input_strings = []
     for i, example in enumerate(generator):
@@ -619,6 +631,7 @@ if __name__ == "__main__":
         ae_paths=ae_paths,
         n_inputs=demo_config.eval_num_inputs,
         device=args.device,
+        dataset=args.dataset,
         overwrite_prev_results=True,
     )
 

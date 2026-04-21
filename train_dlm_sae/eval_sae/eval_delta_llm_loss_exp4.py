@@ -259,6 +259,60 @@ def reconstruct_with_dictionary(dictionary: t.nn.Module, x: t.Tensor) -> t.Tenso
             reconstruct_with_dictionary._warned = True
         return x
 
+def compute_activation_stats(model, submodule, tokenizer, texts: List[str], max_len: int, device: t.device, io: str = "out"):
+    activations = []
+
+    if io == "out":
+        def _hook(_, __, output):
+            act = _first_tensor(output)
+            activations.append(act.detach().cpu())
+            return output
+
+        handle = submodule.register_forward_hook(_hook)
+        try: 
+            batch = tokenize_batch(tokenizer, texts, max_len=max_len, device=device)
+            _safe_forward_with_masks(model, batch, prefer_additive=True)
+        finally:
+            handle.remove()
+    all_acts = t.cat(activations)
+    mean = all_acts.mean().item()
+    std = all_acts.std().item()
+    return mean, std
+
+def register_noise_hook(submodule: t.nn.Module, noise_std: float, seed: int, io: str = "out"):
+    """
+    Adds Gaussian noise to activations using a per-batch seed.
+    Same seed => identical noise across different forwards (e.g. no_sae vs yes_sae).
+    """
+
+    def _make_noise(x: t.Tensor):
+        g = t.Generator(device=x.device)
+        g.manual_seed(seed)
+        return t.randn(x.shape, generator=g, device=x.device, dtype=x.dtype) * noise_std
+
+    if io == "out":
+        def _hook(_, __, output):
+            act = _first_tensor(output)
+            if act is None:
+                return output
+            noise = _make_noise(act)
+            return _replace_first_tensor(output, act + noise)
+        return submodule.register_forward_hook(_hook)
+
+    if io == "in":
+        def _pre_hook(_, inputs):
+            if len(inputs) == 0:
+                return inputs
+            x0 = inputs[0]
+            act = _first_tensor(x0)
+            if act is None:
+                return inputs
+            noise = _make_noise(act)
+            new_x0 = _replace_first_tensor(x0, act + noise)
+            return (new_x0,) + tuple(inputs[1:])
+        return submodule.register_forward_pre_hook(_pre_hook)
+
+    raise ValueError("io must be 'in' or 'out'")
 
 def register_sae_splice_hook(submodule: t.nn.Module, dictionary: t.nn.Module, io: str = "out"):
     """
@@ -436,6 +490,50 @@ def ar_batch_losses(
         "n_eval_tokens": t.tensor(n_tok, device=device),
     }
 
+@t.no_grad()
+def ar_batch_loss_single_condition(
+    model,
+    tokenizer,
+    submodule,
+    dictionary,
+    texts,
+    max_len,
+    device,
+    io="out",
+    noise_std=0.0,
+    seed=0,
+    use_sae=False,
+):
+    enc = tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_len,
+        add_special_tokens=True,
+    )
+    inputs = {k: v.to(device) for k, v in enc.items()}
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+
+    handles = []
+
+    # IMPORTANT: noise FIRST
+    if noise_std > 0:
+        handles.append(register_noise_hook(submodule, noise_std, seed=seed, io=io))
+
+    if use_sae:
+        handles.append(register_sae_splice_hook(submodule, dictionary, io=io))
+
+    try:
+        outputs = model(**inputs)
+        logits = get_logits(outputs)
+        loss, n_tok = next_token_ce(logits, input_ids, attention_mask)
+    finally:
+        for h in handles:
+            h.remove()
+
+    return loss, n_tok
 
 # ---------------- Dream (diffusion) loss ----------------
 
@@ -699,6 +797,30 @@ def main():
             skip_first_n_examples=args.skip_first_n_examples,
         )
 
+    print("[Setup] Computing activation statistics...", flush=True)
+    stat_texts = []
+    stream = new_stream()
+    for _ in range(4): 
+        try:
+            stat_texts.append(next(stream))
+        except StopIteration:
+            break
+
+    layer_stats = {}
+
+    for layer_idx in [1, 5, 10, 14, 23, 27]:
+        stat_submodule = utils.get_submodule(model, layer_idx)
+        mean, std = compute_activation_stats(
+            model,
+            stat_submodule,
+            tokenizer,
+            stat_texts,
+            max_len=args.max_len,
+            device=t.device(args.device)
+        )
+        layer_stats[layer_idx] = {"mean": mean, "std": std}
+        print(f"[Stats] Layer {layer_idx}: mean={mean:.4f}, std={std:.4f}", flush=True)
+
     # ---------------- Evaluate each SAE ----------------
     for idx, d in enumerate(sae_dirs, start=1):
         print(f"\n[Eval {idx}/{len(sae_dirs)}] Loading SAE from: {d}", flush=True)
@@ -713,11 +835,22 @@ def main():
             # Locate target submodule to splice into
             layer = cfg["trainer"]["layer"]
             submodule = utils.get_submodule(model, layer)
+            layer_std = layer_stats[layer]["std"]
+            noise_std = 0.3 * layer_std
             print(f"[Eval] Target layer = {layer} | io = {args.io}", flush=True)
 
             sum_tokens = 0
             w_loss_clean = 0.0
             w_loss_sae = 0.0
+            # Add these accumulators before loop
+            w_clean_no_sae = 0.0
+            w_clean_yes_sae = 0.0
+            w_noise_no_sae = 0.0
+            w_noise_yes_sae = 0.0
+
+            batch_idx = 0
+            base_seed = 12345
+            # noise_alpha = 0.1  # you can expose this as CLI arg later
             stream = new_stream()
 
             pbar = tqdm(
@@ -737,81 +870,91 @@ def main():
                 if not texts:
                     break
 
-                if use_dream_eval:
-                    batch_losses = dream_batch_losses(
-                        model=model,
-                        tokenizer=tokenizer,
-                        submodule=submodule,
-                        dictionary=dictionary,
-                        texts=texts,
-                        max_len=args.max_len,
-                        mask_token_id=mask_token_id,
-                        mask_prob=args.mask_prob,
-                        device=t.device(args.device if ("cuda" in args.device or "cpu" in args.device) else "cpu"),
-                        io=args.io,
-                    )
-                else:
-                    batch_losses = ar_batch_losses(
-                        model=model,
-                        tokenizer=tokenizer,
-                        submodule=submodule,
-                        dictionary=dictionary,
-                        texts=texts,
-                        max_len=args.max_len,
-                        device=t.device(args.device if ("cuda" in args.device or "cpu" in args.device) else "cpu"),
-                        io=args.io,
-                    )
+                seed = base_seed + batch_idx
 
-                n = int(batch_losses["n_eval_tokens"].item())
+                # ---- clean ----
+                loss_clean_no_sae, n = ar_batch_loss_single_condition(
+                    model, tokenizer, submodule, dictionary, texts,
+                    args.max_len, args.device, io=args.io,
+                    noise_std=0.0,
+                    seed=seed,
+                    use_sae=False,
+                )
+
+                loss_clean_yes_sae, _ = ar_batch_loss_single_condition(
+                    model, tokenizer, submodule, dictionary, texts,
+                    args.max_len, args.device, io=args.io,
+                    noise_std=0.0,
+                    seed=seed,
+                    use_sae=True,
+                )
+
+                # ---- noisy ----
+                # (use fixed noise scale for now; you can swap in activation-based scaling later)
+                # noise_std = noise_alpha
+
+                loss_noise_no_sae, _ = ar_batch_loss_single_condition(
+                    model, tokenizer, submodule, dictionary, texts,
+                    args.max_len, args.device, io=args.io,
+                    noise_std=noise_std,
+                    seed=seed,
+                    use_sae=False,
+                )
+
+                loss_noise_yes_sae, _ = ar_batch_loss_single_condition(
+                    model, tokenizer, submodule, dictionary, texts,
+                    args.max_len, args.device, io=args.io,
+                    noise_std=noise_std,
+                    seed=seed,
+                    use_sae=True,
+                )
+
                 if n == 0:
                     continue
 
-                w_loss_clean += float(batch_losses["loss_clean"].item()) * n
-                w_loss_sae += float(batch_losses["loss_sae"].item()) * n
+                # ---- accumulate ----
+                w_clean_no_sae += loss_clean_no_sae.item() * n
+                w_clean_yes_sae += loss_clean_yes_sae.item() * n
+                w_noise_no_sae += loss_noise_no_sae.item() * n
+                w_noise_yes_sae += loss_noise_yes_sae.item() * n
+
                 sum_tokens += n
                 pbar.update(n)
+
+                batch_idx += 1
 
             pbar.close()
             sum_tokens = max(sum_tokens, 1)
 
-            avg_clean = w_loss_clean / sum_tokens
-            avg_sae = w_loss_sae / sum_tokens
-            delta = avg_sae - avg_clean
+            avg_clean_no_sae = w_clean_no_sae / sum_tokens
+            avg_clean_yes_sae = w_clean_yes_sae / sum_tokens
+            avg_noise_no_sae = w_noise_no_sae / sum_tokens
+            avg_noise_yes_sae = w_noise_yes_sae / sum_tokens
 
-            # Output keys keep "lm" naming for AR and "dream" naming for Dream-like
-            if use_dream_eval:
-                out = {
-                    "tokens_evaluated": float(sum_tokens),
-                    "dream_loss_clean": float(avg_clean),
-                    "dream_loss_sae": float(avg_sae),
-                    "delta_dream_loss": float(delta),
-                    "mask_prob": float(args.mask_prob),
-                    "max_len": int(args.max_len),
-                    "batch_size_text": int(args.batch_size_text),
-                    "io": args.io,
-                    "heldout_dataset": args.heldout_dataset,
-                    "skip_first_n_examples": int(args.skip_first_n_examples),
-                }
-                out_path = os.path.join(d, "delta_eval_dream.json")
-            else:
-                out = {
-                    "tokens_evaluated": float(sum_tokens),
-                    "lm_loss_clean": float(avg_clean),
-                    "lm_loss_sae": float(avg_sae),
-                    "delta_lm_loss": float(delta),
-                    "max_len": int(args.max_len),
-                    "batch_size_text": int(args.batch_size_text),
-                    "io": args.io,
-                    "heldout_dataset": args.heldout_dataset,
-                    "skip_first_n_examples": int(args.skip_first_n_examples),
-                }
-                out_path = os.path.join(d, "og_delta_eval_ar.json")
+            delta_noise_no_sae = avg_noise_no_sae - avg_clean_no_sae
+            delta_noise_yes_sae = avg_noise_yes_sae - avg_clean_yes_sae
+
+            out = {
+                "tokens_evaluated": float(sum_tokens),
+
+                "clean_no_sae": avg_clean_no_sae,
+                "clean_yes_sae": avg_clean_yes_sae,
+
+                "noise_no_sae": avg_noise_no_sae,
+                "noise_yes_sae": avg_noise_yes_sae,
+
+                "delta_noise_no_sae": delta_noise_no_sae,
+                "delta_noise_yes_sae": delta_noise_yes_sae,
+
+                # "noise_alpha": noise_alpha,
+            }
+            out_path = os.path.join(d, "delta_eval_ar.json")
 
             with open(out_path, "w") as f:
                 json.dump(out, f, indent=2)
 
-            tag = "ΔDreamLoss" if use_dream_eval else "ΔLMLoss"
-            print(f"[Done] {d} → {tag}={delta:.6f}  tokens={int(sum_tokens):,}", flush=True)
+            # tag = "ΔDreamLoss" if use_dream_eval else "ΔLMLoss"
+            # print(f"[Done] {d} → {tag}={delta:.6f}  tokens={int(sum_tokens):,}", flush=True)
 
         except Exception as e:
             print(f"[Eval] Failed on {d}: {e}", flush=True)
