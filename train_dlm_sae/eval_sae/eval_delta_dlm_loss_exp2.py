@@ -1060,8 +1060,8 @@ def main():
             }
 
             # Save two files as requested
-            out_path_mask = os.path.join(d, "delta_lm_loss_random(mask).json")
-            out_path_unmask = os.path.join(d, "delta_lm_loss_random(unmask).json")
+            out_path_mask = os.path.join(d, "delta_lm_loss_random(mask)_exp2.json")
+            out_path_unmask = os.path.join(d, "delta_lm_loss_random(unmask)_exp2.json")
             with open(out_path_mask, "w") as f:
                 json.dump(out_mask, f, indent=2)
             with open(out_path_unmask, "w") as f:
