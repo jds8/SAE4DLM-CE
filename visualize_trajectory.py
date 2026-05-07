@@ -5,8 +5,8 @@ For each (layer, feature) pair, loads that feature's own top activating text
 from interp_results/ and visualizes the denoising trajectory.
 
 Produces per feature:
-  1. trajectory_L{l}_F{f}.png   — activation heatmap (M=masked, *=just committed)
-  2. commit_order_L{l}_F{f}.png — when each token commits + activation at that moment
+  1. trajectory_L{l}_F{f}.pdf   — activation heatmap (M=masked, *=just committed)
+  2. commit_order_L{l}_F{f}.pdf — when each token commits + activation at that moment
 
 Usage:
     # Recommended: each feature uses its own top text from interp_results/
@@ -58,7 +58,7 @@ def parse_args():
     parser.add_argument("--prompt_max_len", type=int, default=128)
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--steps", type=int, default=64)
-    parser.add_argument("--load_in_4bit", action="store_true", default=True)
+    parser.add_argument("--load_in_4bit", action="store_false", default=False)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out_dir", type=str, default="trajectory_plots")
     parser.add_argument("--top_k", type=int, default=3, help="Number of top texts per feature to show in one plot")
@@ -232,7 +232,7 @@ def plot_activation_heatmap(traj, layer, feature, out_dir, dpi=150):
         f'"{traj["text"][:80]}..."', fontsize=9,
     )
     plt.tight_layout()
-    fname = os.path.join(out_dir, f"trajectory_L{layer}_F{feature}.png")
+    fname = os.path.join(out_dir, f"trajectory_L{layer}_F{feature}.pdf")
     fig.savefig(fname, dpi=dpi)
     plt.close(fig)
     print(f"  Saved: {fname}")
@@ -282,7 +282,7 @@ def plot_commit_order(traj, layer, feature, out_dir, dpi=150):
 
     plt.suptitle(f'L{layer}-F{feature}  |  "{traj["text"][:80]}..."', fontsize=9)
     plt.tight_layout()
-    fname = os.path.join(out_dir, f"commit_order_L{layer}_F{feature}.png")
+    fname = os.path.join(out_dir, f"commit_order_L{layer}_F{feature}.pdf")
     fig.savefig(fname, dpi=dpi)
     plt.close(fig)
     print(f"  Saved: {fname}")
@@ -354,7 +354,7 @@ def plot_top_k_commit_order(trajs: list, layer: int, feature: int, out_dir: str,
         fontsize=10,
     )
     plt.tight_layout()
-    fname = os.path.join(out_dir, f"top{k}_commit_L{layer}_F{feature}.png")
+    fname = os.path.join(out_dir, f"top{k}_commit_L{layer}_F{feature}.pdf")
     fig.savefig(fname, dpi=dpi)
     plt.close(fig)
     print(f"  Saved: {fname}")
@@ -406,7 +406,7 @@ def plot_top_k_heatmaps(trajs: list, layer: int, feature: int, out_dir: str, dpi
         fontsize=10,
     )
     plt.tight_layout()
-    fname = os.path.join(out_dir, f"top{k}_heatmap_L{layer}_F{feature}.png")
+    fname = os.path.join(out_dir, f"top{k}_heatmap_L{layer}_F{feature}.pdf")
     fig.savefig(fname, dpi=dpi)
     plt.close(fig)
     print(f"  Saved: {fname}")
