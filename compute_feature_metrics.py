@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         "--layers",
         type=int,
         nargs="+",
-        default=[1, 10, 23],
+        default=[1, 5, 10, 14, 23, 27],
         help="Layers to score.",
     )
     parser.add_argument(
@@ -189,6 +189,8 @@ def compute_layer_feature_table(
                 "unmasked_gap_up": max(0.0, l_u - e_u),
                 "masked_down_corr": max(0.0, -c_m),
                 "unmasked_up_corr": max(0.0, c_u),
+                "masked_up_corr": max(0.0, c_m),
+                "unmasked_down_corr": max(0.0, -c_u),
             }
         )
 
@@ -202,6 +204,7 @@ def add_scores(df: pd.DataFrame, metric_mode: str = "default") -> pd.DataFrame:
         df["early_score"] = df["M_m"] * df["masked_gap_down"] * df["masked_down_corr"]
         df["late_score"] = df["M_u"] * df["unmasked_gap_up"] * df["unmasked_up_corr"]
         df["bridge_score"] = df["E_m"] * df["L_u"] * df["masked_down_corr"] * df["unmasked_up_corr"]
+        df["middle_bridge_score"] = df["L_m"] * df["E_u"] * df["masked_up_corr"] * df["unmasked_down_corr"]
 
     elif metric_mode == "gap_only":
         df["early_score"] = df["masked_gap_down"]
@@ -287,8 +290,16 @@ def select_top_features(
             .head(top_k_per_type)
             .assign(candidate_type="bridge")
         )
+        try:
+            middle_bridge = (
+                df.sort_values("middle_bridge_score", ascending=False)
+                .head(top_k_per_type)
+                .assign(candidate_type="middle_bridge")
+            )
+            selected_tables.extend([early, bridge, middle_bridge, late])
+        except:
+            selected_tables.extend([early, bridge, late])
 
-        selected_tables.extend([early, bridge, late])
 
     all_df = pd.concat(all_tables, ignore_index=True)
     selected_df = pd.concat(selected_tables, ignore_index=True)
@@ -299,6 +310,7 @@ def select_top_features(
         "candidate_type",
         "early_score",
         "bridge_score",
+        "middle_bridge_score",
         "late_score",
         "E_m",
         "L_m",
